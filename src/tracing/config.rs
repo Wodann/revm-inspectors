@@ -393,6 +393,9 @@ pub enum StackSnapshotType {
     Pushes,
     /// Record the full stack
     Full,
+    /// Record the top entry of the full stack. If the full stack is empty, records an empty stack.
+    /// Does not record the push stack.
+    Top,
 }
 
 impl StackSnapshotType {
@@ -412,6 +415,12 @@ impl StackSnapshotType {
     #[inline]
     pub const fn is_pushes(self) -> bool {
         matches!(self, Self::Pushes)
+    }
+
+    /// Returns true if this is the [StackSnapshotType::Top] variant
+    #[inline]
+    pub const fn is_top(self) -> bool {
+        matches!(self, Self::Top)
     }
 }
 

@@ -445,6 +445,8 @@ impl TracingInspector {
             || self.config.record_stack_snapshots.is_full()
         {
             Some(interp.stack.data().as_slice().into())
+        } else if self.config.record_stack_snapshots.is_top() {
+            Some(interp.stack.data().last().cloned().as_slice().into())
         } else {
             None
         };
