@@ -44,7 +44,7 @@ mod opcount;
 pub use opcount::OpcodeCountInspector;
 
 pub mod types;
-use types::{CallLog, CallTrace, CallTraceStep};
+use types::{CallLog, CallTrace, StepDetail, StepStore};
 
 mod utils;
 
@@ -62,6 +62,12 @@ pub use mux::{Error as MuxError, MuxInspector};
 mod debug;
 pub use debug::{DebugInspector, DebugInspectorError};
 
+/// Upper bound on the bytes the step stores kept for reuse across transactions may hold,
+/// counting each store's struct and the capacity of its columns, so that neither a call-heavy
+/// transaction (one store per trace node) nor a step-heavy one (one large store) pins memory for
+/// the lifetime of the inspector.
+const MAX_REUSABLE_STEP_STORE_BYTES: usize = 8 * 1024 * 1024;
+
 /// An inspector that collects call traces.
 ///
 /// This [Inspector] can be hooked into revm's EVM which then calls the inspector
@@ -78,7 +84,9 @@ pub struct TracingInspector {
     traces: CallTraceArena,
     /// Tracks active calls
     trace_stack: Vec<usize>,
-    /// Tracks whether the next `step_end` should be recorded. Set in `start_step`.
+    /// Tracks whether `record_detail` pushed a detail record for the step being executed, which
+    /// `step_end` then completes and clears the flag. Set only for the duration of that step, so
+    /// it is false in every other hook.
     record_step_end: bool,
     /// Tracks the return value of the last call
     last_call_return_data: Option<Bytes>,
@@ -88,10 +96,19 @@ pub struct TracingInspector {
     ///
     /// This is filled during execution.
     spec_id: Option<SpecId>,
-    /// Pool of reusable _empty_ step vectors to reduce allocations.
+    /// Step stores of finished traces, kept for reuse to avoid reallocating their columns.
     ///
-    /// All `Vec<CallTraceStep>` are always empty but may have capacity.
-    reusable_step_vecs: Vec<Vec<CallTraceStep>>,
+    /// All stores are empty but may have capacity.
+    reusable_step_stores: Vec<StepStore>,
+    /// The bytes [`Self::reusable_step_stores`] holds, as counted against
+    /// [`MAX_REUSABLE_STEP_STORE_BYTES`].
+    reusable_step_store_bytes: usize,
+}
+
+/// Returns the bytes `steps` costs the pool of reusable stores.
+#[inline]
+fn pooled_step_store_bytes(steps: &StepStore) -> usize {
+    mem::size_of::<StepStore>() + steps.capacity_bytes()
 }
 
 impl TracingInspector {
@@ -103,7 +120,9 @@ impl TracingInspector {
     /// Resets the inspector to its initial state of [Self::new].
     /// This makes the inspector ready to be used again.
     ///
-    /// Note that this method has no effect on the allocated capacity of the vector.
+    /// The finished traces' step stores are kept for reuse, up to a fixed byte budget: a store
+    /// whose detail records alone exceed it keeps only its `(pc, op)` columns, and stores beyond
+    /// the budget are dropped.
     #[inline]
     pub fn fuse(&mut self) {
         let Self {
@@ -115,17 +134,27 @@ impl TracingInspector {
             record_step_end,
             // kept
             config,
-            reusable_step_vecs,
+            reusable_step_stores,
+            reusable_step_store_bytes,
         } = self;
 
-        // if we record steps we can reuse the individual calltracestep vecs
-        if config.record_steps.is_full() {
+        // if we record steps we can reuse the step stores, within a byte budget
+        if config.record_steps.is_enabled() {
             for node in &mut traces.arena {
-                // move out and store the reusable steps vec
                 let mut steps = mem::take(&mut node.trace.steps);
-                // ensure steps are cleared
-                steps.clear();
-                reusable_step_vecs.push(steps);
+                steps.reset();
+                let mut bytes = pooled_step_store_bytes(&steps);
+                if *reusable_step_store_bytes + bytes > MAX_REUSABLE_STEP_STORE_BYTES {
+                    // The detail column dominates a store recorded in full; the `(pc, op)`
+                    // columns are worth keeping on their own.
+                    steps.clear_details();
+                    bytes = pooled_step_store_bytes(&steps);
+                    if *reusable_step_store_bytes + bytes > MAX_REUSABLE_STEP_STORE_BYTES {
+                        continue;
+                    }
+                }
+                *reusable_step_store_bytes += bytes;
+                reusable_step_stores.push(steps);
             }
         }
 
@@ -363,8 +392,14 @@ impl TracingInspector {
             PushTraceKind::PushAndAttachToParent
         };
 
-        // find an empty steps vec or create a new one
-        let steps = self.reusable_step_vecs.pop().unwrap_or_default();
+        // find an empty step store or create a new one
+        let steps = match self.reusable_step_stores.pop() {
+            Some(steps) => {
+                self.reusable_step_store_bytes -= pooled_step_store_bytes(&steps);
+                steps
+            }
+            None => StepStore::default(),
+        };
 
         self.trace_stack.push(self.traces.push_trace(
             0,
@@ -417,43 +452,56 @@ impl TracingInspector {
         }
     }
 
-    /// Starts tracking a step
+    /// Records the program counter and opcode of the step about to execute.
     ///
-    /// Invoked on [Inspector::step]
+    /// Invoked on [Inspector::step].
     ///
     /// # Panics
     ///
     /// This expects an existing [CallTrace], in other words, this panics if not within the context
     /// of a call.
-    #[cold]
-    fn start_step<CTX: ContextTr<Journal: JournalExt>>(
-        &mut self,
-        interp: &mut Interpreter,
-        context: &mut CTX,
-    ) {
+    ///
+    /// Returns the index of the trace the step belongs to, the step's index within it and its
+    /// opcode.
+    #[inline]
+    fn record_pc_op(&mut self, interp: &Interpreter) -> (usize, usize, OpCode) {
         // We always want an OpCode, even it is unknown because it could be an additional opcode
         // that not a known constant.
         let op = OpCode::new_or_unknown(interp.bytecode.opcode());
+        let trace_idx = self.last_trace_idx();
+        let idx = self.traces.arena[trace_idx].trace.steps.push(interp.bytecode.pc(), op);
+        (trace_idx, idx, op)
+    }
 
-        let record = self.config.should_record_opcode(op);
-        self.record_step_end = record;
-        if !record {
+    /// Records the detail of the step about to execute, whose program counter and opcode were
+    /// just recorded by [`Self::record_pc_op`] as step `step_idx` of trace `trace_idx`.
+    ///
+    /// Invoked on [Inspector::step] under [`StepRecording::Full`]. Marked cold so that the hot
+    /// `(pc, op)` push is laid out without it: `#[inline(never)]` alone measured 0.6 ns/opcode
+    /// slower with steps off and 1.1 ns/opcode slower under `PcAndOp`, for no gain under `Full`.
+    #[cold]
+    fn record_detail<CTX: ContextTr<Journal: JournalExt>>(
+        &mut self,
+        interp: &mut Interpreter,
+        context: &mut CTX,
+        trace_idx: usize,
+        step_idx: usize,
+        op: OpCode,
+    ) {
+        if !self.config.should_record_opcode(op) {
             return;
         }
+        self.record_step_end = true;
 
-        let trace_idx = self.last_trace_idx();
         let node = &mut self.traces.arena[trace_idx];
 
-        // Reuse the memory from the previous step if:
-        // - there is not opcode filter -- in this case we cannot rely on the order of steps
-        // - it exists and has not modified memory
+        // Reuse the memory from the previous step if it was the step executed right before this
+        // one, was recorded in full, and has not modified memory.
         let memory = self.config.record_memory_snapshots.then(|| {
-            if self.config.record_opcodes_filter.is_none() {
-                if let Some(prev) = node.trace.steps.last() {
-                    if !prev.op.modifies_memory() {
-                        if let Some(memory) = &prev.memory {
-                            return memory.clone();
-                        }
+            if let Some(prev) = node.trace.steps.last_detailed() {
+                if prev.step_index + 1 == step_idx && !prev.op.modifies_memory() {
+                    if let Some(memory) = &prev.memory {
+                        return memory.clone();
                     }
                 }
             }
@@ -491,39 +539,39 @@ impl TracingInspector {
 
         self.last_journal_len = context.journal_ref().journal().len();
 
-        let step_idx = node.trace.steps.len();
-        node.trace.steps.push(CallTraceStep {
-            pc: interp.bytecode.pc(),
-            op,
-            stack,
-            memory,
-            returndata,
-            gas_remaining: interp.gas.remaining(),
-            gas_refund_counter: interp.gas.refunded() as u64,
-            gas_used,
-            immediate_bytes,
-            state_gas_cost: None,
-            state_gas_reservoir: SpecId::is_enabled_in(
-                interp.runtime_flag.spec_id(),
-                SpecId::AMSTERDAM,
-            )
-            .then_some(interp.gas.reservoir()),
-            state_gas_spent: interp.gas.state_gas_spent(),
+        let detail_idx = node.trace.steps.push_detail(
+            step_idx,
+            StepDetail {
+                stack,
+                memory,
+                returndata,
+                gas_remaining: interp.gas.remaining(),
+                gas_refund_counter: interp.gas.refunded() as u64,
+                gas_used,
+                immediate_bytes,
+                state_gas_cost: None,
+                state_gas_reservoir: SpecId::is_enabled_in(
+                    interp.runtime_flag.spec_id(),
+                    SpecId::AMSTERDAM,
+                )
+                .then_some(interp.gas.reservoir()),
+                state_gas_spent: interp.gas.state_gas_spent(),
 
-            // These fields will be populated in `step_end`.
-            push_stack: None,
-            gas_cost: 0,
-            storage_change: None,
-            status: None,
+                // These fields will be populated in `step_end`.
+                push_stack: None,
+                gas_cost: 0,
+                storage_change: None,
+                status: None,
 
-            // This is never populated in `TracingInspector`.
-            decoded: None,
-        });
+                // This is never populated in `TracingInspector`.
+                decoded: None,
+            },
+        );
 
-        node.ordering.push(TraceMemberOrder::Step(step_idx));
+        node.ordering.push(TraceMemberOrder::Step(detail_idx));
     }
 
-    /// Fills the current trace with the output of a step.
+    /// Fills the current step's detail with the output of the step.
     ///
     /// Invoked on [Inspector::step_end].
     #[cold]
@@ -532,17 +580,24 @@ impl TracingInspector {
         interp: &mut Interpreter,
         context: &mut CTX,
     ) {
-        // No need to reset here, since it is only read here and it will be overwritten by the next
-        // step.
-        if !self.record_step_end {
-            return;
-        }
-
         let trace_idx = self.last_trace_idx();
         let node = &mut self.traces.arena[trace_idx];
-        let step = node.trace.steps.last_mut().unwrap();
+        let steps = &mut node.trace.steps;
+        // `record_step_end` is set only when `record_detail` pushed a record for the step
+        // `record_pc_op` had just appended to this trace, and no other hook can run between an
+        // instruction's `step` and `step_end`, so the last detail is that record.
+        let Some(last) = steps.len().checked_sub(1) else {
+            debug_assert!(false, "a detail was recorded for a step of an empty trace");
+            return;
+        };
+        let op = OpCode::new_or_unknown(steps.op_at(last));
+        let Some((step_index, step)) = steps.last_detail_mut() else {
+            debug_assert!(false, "a detail was recorded but the trace has none");
+            return;
+        };
+        debug_assert_eq!(step_index, last, "the last detail is not the step just recorded");
 
-        // See comments in `start_step`.
+        // See comments in `record_detail`.
         debug_assert!(
             step.push_stack.is_none()
                 && step.gas_cost == 0
@@ -555,7 +610,7 @@ impl TracingInspector {
         if self.config.record_stack_snapshots.is_all()
             || self.config.record_stack_snapshots.is_pushes()
         {
-            let outputs = if step.op.is_valid() { step.op.outputs() as usize } else { 0 };
+            let outputs = if op.is_valid() { op.outputs() as usize } else { 0 };
             step.push_stack = Some(
                 interp
                     .stack
@@ -570,7 +625,7 @@ impl TracingInspector {
 
         // If journal has not changed, there is no state change to be recorded.
         if self.config.record_state_diff && journal.len() != self.last_journal_len {
-            let op = step.op.get();
+            let op = op.get();
 
             step.storage_change = if matches!(op, opcode::SLOAD | opcode::SSTORE) {
                 let reason = match op {
@@ -628,14 +683,25 @@ where
 
     #[inline]
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        if self.config.record_steps.is_full() {
-            self.start_step(interp, context);
+        match self.config.record_steps {
+            StepRecording::None => {}
+            StepRecording::PcAndOp => {
+                self.record_pc_op(interp);
+            }
+            StepRecording::Full => {
+                let (trace_idx, step_idx, op) = self.record_pc_op(interp);
+                self.record_detail(interp, context, trace_idx, step_idx, op);
+            }
         }
     }
 
     #[inline]
     fn step_end(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        if self.config.record_steps.is_full() {
+        // Only `record_detail` sets the flag and only this clears it, so a detail recorded under
+        // `Full` is completed even if the level was lowered in between, and a level raised in
+        // between (or in a frame hook) completes nothing.
+        if self.record_step_end {
+            self.record_step_end = false;
             self.fill_step_on_step_end(interp, context);
         }
     }

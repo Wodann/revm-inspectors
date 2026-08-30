@@ -331,14 +331,18 @@ impl ParityTraceBuilder {
                     current = self.nodes.get(*child).expect("there should be a child");
                 }
                 None => {
-                    let mut instructions = Vec::with_capacity(current.trace.step_count());
+                    let mut instructions = Vec::with_capacity(current.trace.detailed_step_count());
 
-                    for step in current.trace.iter_detailed_steps() {
+                    // Sub-calls are matched to call-like steps over the whole base track, so a
+                    // call executed outside a full-recording window still consumes its sub-call;
+                    // only steps recorded in full become instructions.
+                    for step in current.trace.iter_steps() {
                         let maybe_sub_call = if step.is_call_like_op() {
                             sub_stack.pop_front().flatten()
                         } else {
                             None
                         };
+                        let Some(step) = step.detailed() else { continue };
 
                         if step.is_stop() && instructions.is_empty() && self.is_last_step_stop_op()
                         {

@@ -59,9 +59,9 @@ impl<'a> GethTraceBuilder<'a> {
         self.nodes.into_owned()
     }
 
-    /// Returns the sum of all steps in the recorded node traces.
+    /// Returns the number of steps recorded in full across the node traces.
     fn trace_step_count(&self) -> usize {
-        self.nodes.iter().map(|node| node.trace.step_count()).sum()
+        self.nodes.iter().map(|node| node.trace.detailed_step_count()).sum()
     }
 
     fn is_eip8037_enabled(&self) -> bool {
@@ -83,7 +83,7 @@ impl<'a> GethTraceBuilder<'a> {
         // they appear in the transaction, we need to process steps of call nodes when they appear.
         // When we find a call step, we push all the steps of the child trace on the stack, so they
         // are processed next. The very next step is the last item on the stack
-        let mut step_stack = VecDeque::with_capacity(main_trace_node.trace.step_count());
+        let mut step_stack = VecDeque::with_capacity(main_trace_node.trace.detailed_step_count());
 
         main_trace_node.push_steps_on_stack(&mut step_stack);
 
@@ -91,29 +91,33 @@ impl<'a> GethTraceBuilder<'a> {
         while let Some(CallTraceStepStackItem { trace_node, step, call_child_id }) =
             step_stack.pop_back()
         {
-            // We increment the depth by one because steps that are part of call at depth N should
-            // have depth N + 1. For example, steps inside of a top-level call should
-            // have depth 1.
-            let mut log = step.convert_to_geth_struct_log(opts, trace_node.trace.depth as u64 + 1);
+            if let Some(step) = step {
+                // We increment the depth by one because steps that are part of call at depth N
+                // should have depth N + 1. For example, steps inside of a top-level call should
+                // have depth 1.
+                let mut log =
+                    step.convert_to_geth_struct_log(opts, trace_node.trace.depth as u64 + 1);
 
-            // Fill in memory and storage depending on the options
-            if opts.is_storage_enabled() {
-                let contract_storage = storage.entry(trace_node.execution_address()).or_default();
-                if let Some(change) = &step.storage_change {
-                    contract_storage.insert(change.key.into(), change.value.into());
+                // Fill in memory and storage depending on the options
+                if opts.is_storage_enabled() {
+                    let contract_storage =
+                        storage.entry(trace_node.execution_address()).or_default();
+                    if let Some(change) = &step.storage_change {
+                        contract_storage.insert(change.key.into(), change.value.into());
+                    }
+
+                    if matches!(step.op.get(), opcode::SLOAD | opcode::SSTORE) {
+                        log.storage = Some(contract_storage.clone());
+                    }
                 }
 
-                if matches!(step.op.get(), opcode::SLOAD | opcode::SSTORE) {
-                    log.storage = Some(contract_storage.clone());
+                if opts.is_return_data_enabled() {
+                    log.return_data = Some(step.returndata.clone());
                 }
-            }
 
-            if opts.is_return_data_enabled() {
-                log.return_data = Some(step.returndata.clone());
+                // Add step to geth trace
+                struct_logs.push(log);
             }
-
-            // Add step to geth trace
-            struct_logs.push(log);
 
             // If the step is a call, we first push all the steps of the child trace on the stack,
             // so they are processed next

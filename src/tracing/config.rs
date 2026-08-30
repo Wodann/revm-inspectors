@@ -55,20 +55,32 @@ impl OpcodeFilter {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum StepRecording {
     /// Do not record steps.
+    ///
+    /// Switching to this level while a transaction executes leaves a gap in the base track, so a
+    /// call executed meanwhile cannot be matched to its child frame afterwards; use [`PcAndOp`]
+    /// as the floor when switching levels mid-transaction.
+    ///
+    /// [`PcAndOp`]: Self::PcAndOp
     #[default]
     None,
-    /// Record a full [`CallTraceStep`](crate::tracing::types::CallTraceStep) — gas accounting,
-    /// status and the snapshots the other `record_*` options enable — for every executed step the
+    /// Record the program counter and opcode of every executed step, and nothing else.
+    ///
+    /// Enough for consumers that only need to know which instructions ran, such as source-level
+    /// stack traces, at a fraction of the memory of a full record. The [`OpcodeFilter`] does not
+    /// apply: every executed step is recorded.
+    PcAndOp,
+    /// Record a [`StepDetail`](crate::tracing::types::StepDetail) — gas accounting, status and
+    /// the snapshots the other `record_*` options enable — for every executed step the
     /// [`OpcodeFilter`] admits. These are the steps
     /// [`CallTrace::iter_detailed_steps`](crate::tracing::types::CallTrace::iter_detailed_steps)
-    /// yields.
+    /// yields. The base track still records every executed step (five bytes each); the filter
+    /// applies to the detail overlay only.
     Full,
 }
 
 impl StepRecording {
-    /// Returns true if any per-step recording is enabled. Callers that need the full
-    /// [`CallTraceStep`](crate::tracing::types::CallTraceStep) record should use
-    /// [`Self::is_full`].
+    /// Returns true if any per-step recording is enabled. Callers that need the detail records
+    /// should use [`Self::is_full`].
     #[inline]
     pub const fn is_enabled(self) -> bool {
         !matches!(self, Self::None)
@@ -85,6 +97,7 @@ impl StepRecording {
     pub const fn merge(self, other: Self) -> Self {
         match (self, other) {
             (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::PcAndOp, _) | (_, Self::PcAndOp) => Self::PcAndOp,
             (Self::None, Self::None) => Self::None,
         }
     }
@@ -106,8 +119,10 @@ pub struct TracingInspectorConfig {
     pub record_state_diff: bool,
     /// Whether to record returndata buffer snapshots.
     pub record_returndata_snapshots: bool,
-    /// Optional filter for opcodes to record. If provided, only steps with opcode in this set will
-    /// be recorded.
+    /// Optional filter for the steps to record in full. If provided, only steps with an opcode in
+    /// this set get a detail record under [`StepRecording::Full`]; the `(pc, op)` base track
+    /// records every executed step regardless, since child frames are attributed by counting the
+    /// call-like steps in it.
     pub record_opcodes_filter: Option<OpcodeFilter>,
     /// Whether to ignore precompile calls.
     pub exclude_precompile_calls: bool,
@@ -314,7 +329,8 @@ impl TracingInspectorConfig {
         self
     }
 
-    /// Disable recording of individual opcode level steps ([`StepRecording::None`])
+    /// Disable recording of individual opcode level steps ([`StepRecording::None`]). See there
+    /// for the caveat when disabling steps while a transaction executes.
     pub const fn disable_steps(self) -> Self {
         self.set_steps(false)
     }
@@ -324,7 +340,8 @@ impl TracingInspectorConfig {
         self.set_steps(true)
     }
 
-    /// Configure whether individual opcode level steps should be recorded in full.
+    /// Configure whether individual opcode level steps should be recorded in full
+    /// ([`StepRecording::Full`]) or not at all ([`StepRecording::None`]).
     pub const fn set_steps(self, record_steps: bool) -> Self {
         self.set_step_recording(if record_steps {
             StepRecording::Full
@@ -393,7 +410,7 @@ impl TracingInspectorConfig {
     ///
     /// This is a convenience method for setting both [TracingInspectorConfig::set_steps] and
     /// [TracingInspectorConfig::set_state_diffs] since tracking state diffs requires steps recorded
-    /// in full.
+    /// in full; `false` disables step recording altogether.
     pub const fn set_steps_and_state_diffs(self, steps_and_diffs: bool) -> Self {
         self.set_state_diffs(steps_and_diffs).set_steps(steps_and_diffs)
     }
@@ -425,8 +442,8 @@ impl TracingInspectorConfig {
         self.set_immediate_bytes(true)
     }
 
-    /// If [OpcodeFilter] is configured, returns whether the given opcode should be recorded.
-    /// Otherwise, always returns true.
+    /// If [OpcodeFilter] is configured, returns whether a step executing the given opcode should
+    /// be recorded in full. Otherwise, always returns true.
     #[inline]
     pub fn should_record_opcode(&self, op: OpCode) -> bool {
         self.record_opcodes_filter.as_ref().is_none_or(|filter| filter.is_enabled(op))

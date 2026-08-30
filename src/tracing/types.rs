@@ -100,43 +100,62 @@ pub struct CallTrace {
     pub gas_refund_counter: u64,
     /// The final status of the call.
     pub status: Option<InstructionResult>,
-    /// Opcode-level execution steps.
+    /// Opcode-level execution steps: the program counter and opcode of every executed step, and
+    /// a detail record for the steps that were recorded in full (see [`StepStore`]).
     ///
-    /// Prefer reading these through [`Self::iter_detailed_steps`] and [`Self::detailed_step`]:
-    /// direct access couples the reader to how steps are stored.
-    pub steps: Vec<CallTraceStep>,
+    /// Prefer reading these through [`Self::iter_steps`], [`Self::iter_detailed_steps`] and
+    /// [`Self::detailed_step`]: direct access couples the reader to how steps are stored. A trace
+    /// serialized without steps deserializes with an empty store.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub steps: StepStore,
     /// Optional complementary decoded call data.
     pub decoded: Option<Box<DecodedCallTrace>>,
 }
 
 impl CallTrace {
-    /// Returns how many steps were recorded.
+    /// Returns how many steps the base track holds: every step executed while step recording was
+    /// enabled. See [`Self::detailed_step_count`] for the steps recorded in full.
     #[inline]
     pub fn step_count(&self) -> usize {
         self.steps.len()
     }
 
-    /// Returns a view of every recorded step, in execution order.
+    /// Returns how many steps were recorded in full, i.e. how many [`Self::iter_detailed_steps`]
+    /// yields.
+    #[inline]
+    pub fn detailed_step_count(&self) -> usize {
+        self.steps.detailed_len()
+    }
+
+    /// Returns a view of every step in the base track, in execution order.
+    #[inline]
+    pub fn iter_steps(
+        &self,
+    ) -> impl ExactSizeIterator<Item = StepRef<'_>> + DoubleEndedIterator + Clone {
+        self.steps.iter()
+    }
+
+    /// Returns a view of the steps that were recorded in full, in execution order.
     #[inline]
     pub fn iter_detailed_steps(
         &self,
     ) -> impl ExactSizeIterator<Item = DetailedStepRef<'_>> + DoubleEndedIterator + Clone {
-        self.steps.iter().map(DetailedStepRef::new)
+        self.steps.iter_detailed()
     }
 
-    /// Returns the recorded step at `idx`.
+    /// Returns the step recorded in full at `idx` in the detail overlay.
     ///
     /// Indices come from the enclosing [`CallTraceNode::ordering`] (a [`TraceMemberOrder::Step`]
     /// entry) and from [`DecodedTraceStep::InternalCall`].
     #[inline]
     pub fn detailed_step(&self, idx: usize) -> Option<DetailedStepRef<'_>> {
-        self.steps.get(idx).map(DetailedStepRef::new)
+        self.steps.detailed(idx)
     }
 
-    /// Returns the last recorded step, if any.
+    /// Returns the last step recorded in full, if any.
     #[inline]
     pub fn last_detailed_step(&self) -> Option<DetailedStepRef<'_>> {
-        self.steps.last().map(DetailedStepRef::new)
+        self.steps.last_detailed()
     }
 
     /// Returns true if the status code is an error or revert, See [InstructionResult::Revert]
@@ -284,6 +303,26 @@ pub struct CallTraceNode {
 }
 
 impl CallTraceNode {
+    /// Discards the recorded EVM steps — base track and detail overlay — and their entries in the
+    /// ordering, keeping the calls and logs.
+    pub fn clear_steps(&mut self) {
+        self.trace.steps = StepStore::default();
+        self.retain_non_step_ordering();
+    }
+
+    /// Discards the detail overlay and its entries in the ordering, keeping the base track, the
+    /// calls and the logs.
+    pub fn clear_step_details(&mut self) {
+        self.trace.steps.clear_details();
+        self.retain_non_step_ordering();
+    }
+
+    fn retain_non_step_ordering(&mut self) {
+        self.ordering.retain(|item| !matches!(item, TraceMemberOrder::Step(_)));
+        // `retain` keeps the capacity, which grew with one entry per detailed step.
+        self.ordering.shrink_to_fit();
+    }
+
     /// Returns the call context's execution address
     ///
     /// See `Inspector::call` impl of [TracingInspector](crate::tracing::TracingInspector)
@@ -301,30 +340,32 @@ impl CallTraceNode {
         &'a self,
         stack: &mut VecDeque<CallTraceStepStackItem<'a>>,
     ) {
-        let initial_len = stack.len();
+        // Children are attributed to call-like steps in execution order, counted over the whole
+        // base track so that a call executed outside a full-recording window still advances to
+        // the next child. A call-like step without a child is one that reverted or ran out of gas
+        // before a frame was opened: <https://github.com/paradigmxyz/reth/issues/3915>. Walking
+        // the steps backwards, the children are therefore handed out from the last attributed one
+        // down.
+        let call_like_steps = self.trace.iter_steps().filter(|step| step.is_call_like_op()).count();
+        let mut child_id = call_like_steps.min(self.children.len());
+        let mut unattributed = call_like_steps - child_id;
 
-        // First, extend the stack with all steps in reverse order
-        stack.extend(self.trace.iter_detailed_steps().rev().map(|step| CallTraceStepStackItem {
-            trace_node: self,
-            step,
-            call_child_id: None,
-        }));
-
-        // Then, iterate over the inserted range in reverse to set call_child_id values
-        // Since we inserted in reverse order, we need to process from the end to maintain
-        // the correct child_id assignment order
-        let mut child_id = 0;
-        for i in (initial_len..stack.len()).rev() {
-            let item = &mut stack[i];
-
-            // If the opcode is a call, set the child trace id
-            if item.step.is_call_like_op() {
-                // The opcode of this step is a call but it's possible that this step resulted
-                // in a revert or out of gas error in which case there's no actual child call executed and recorded: <https://github.com/paradigmxyz/reth/issues/3915>
-                if let Some(call_id) = self.children.get(child_id).copied() {
-                    item.call_child_id = Some(call_id);
-                    child_id += 1;
+        stack.reserve(self.trace.steps.detailed_len() + child_id);
+        for step in self.trace.iter_steps().rev() {
+            let mut call_child_id = None;
+            if step.is_call_like_op() {
+                if unattributed > 0 {
+                    unattributed -= 1;
+                } else {
+                    child_id -= 1;
+                    call_child_id = Some(self.children[child_id]);
                 }
+            }
+            // A step recorded in full becomes a struct log; a call-like step that was not still
+            // has to push its child frame, whose steps may have been recorded in full.
+            let step = step.detailed();
+            if step.is_some() || call_child_id.is_some() {
+                stack.push_back(CallTraceStepStackItem { trace_node: self, step, call_child_id });
             }
         }
     }
@@ -647,7 +688,9 @@ pub(crate) struct CallTraceStepStackItem<'a> {
     /// The trace node that contains this step
     pub(crate) trace_node: &'a CallTraceNode,
     /// The step that this stack item represents
-    pub(crate) step: DetailedStepRef<'a>,
+    ///
+    /// `None` for a call-like step that was not recorded in full but has a child frame to push.
+    pub(crate) step: Option<DetailedStepRef<'a>>,
     /// The index of the child call in the CallArena if this step's opcode is a call
     pub(crate) call_child_id: Option<usize>,
 }
@@ -660,7 +703,8 @@ pub enum TraceMemberOrder {
     Log(usize),
     /// Contains the index of the corresponding trace node
     Call(usize),
-    /// Contains the index of the corresponding step, if those are being traced
+    /// Contains the index of the corresponding step in the call's detail overlay; only steps
+    /// recorded in full get an entry. See [`StepStore::detailed`].
     Step(usize),
 }
 
@@ -682,23 +726,20 @@ pub struct DecodedInternalCall {
 pub enum DecodedTraceStep {
     /// Decoded internal function call. Displayed similarly to external calls.
     ///
-    /// Keeps decoded internal call data and an index of the step where the internal call execution
-    /// ends.
+    /// Keeps decoded internal call data and the index of the detailed step where the internal call
+    /// execution ends — an index into the call's detail overlay, as a [`TraceMemberOrder::Step`]
+    /// entry carries and [`CallTrace::detailed_step`] resolves.
     InternalCall(DecodedInternalCall, usize),
     /// Arbitrary line representing the step. Might be used for displaying individual opcodes.
     Line(String),
 }
 
-/// Represents a tracked call step during execution
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The detail record of a step that was recorded in full: everything about the step besides its
+/// program counter and opcode, which every step keeps in [`StepStore`]'s base track.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct CallTraceStep {
+pub struct StepDetail {
     // Fields filled in `step`
-    /// Program counter before step execution
-    pub pc: usize,
-    /// Opcode to be executed
-    #[cfg_attr(feature = "serde", serde(with = "opcode_serde"))]
-    pub op: OpCode,
     /// Stack before step execution
     pub stack: Option<Box<[U256]>>,
     /// The new stack items placed by this step if any
@@ -737,7 +778,465 @@ pub struct CallTraceStep {
     pub decoded: Option<Box<DecodedTraceStep>>,
 }
 
-impl CallTraceStep {
+impl StepDetail {
+    // Returns true if the status code is an error or revert, See [InstructionResult::Revert]
+    #[inline]
+    pub(crate) const fn is_error(&self) -> bool {
+        let Some(status) = self.status else {
+            return false;
+        };
+        status.is_halt()
+    }
+
+    /// Returns the error message if it is an erroneous result.
+    #[inline]
+    pub(crate) fn as_error(&self) -> Option<String> {
+        self.is_error().then(|| format!("{:?}", self.status))
+    }
+
+    /// Returns `DecodedTraceStep` from `StepDetail`.
+    pub fn decoded_mut(&mut self) -> &mut DecodedTraceStep {
+        self.decoded.get_or_insert_with(|| Box::new(DecodedTraceStep::Line(String::new())))
+    }
+
+    /// Returns the heap bytes the record owns: the snapshots and the boxed fields.
+    fn owned_bytes(&self) -> usize {
+        self.stack.as_ref().map_or(0, |stack| stack.len() * core::mem::size_of::<U256>())
+            + self.push_stack.as_ref().map_or(0, |stack| stack.len() * core::mem::size_of::<U256>())
+            + self.memory.as_ref().map_or(0, RecordedMemory::len)
+            + self.returndata.len()
+            + self.immediate_bytes.as_ref().map_or(0, |bytes| bytes.len())
+            + self.storage_change.as_ref().map_or(0, |_| core::mem::size_of::<StorageChange>())
+            + self.decoded.as_ref().map_or(0, |_| core::mem::size_of::<DecodedTraceStep>())
+    }
+}
+
+/// An owned copy of one recorded step: its program counter and opcode, plus the detail record when
+/// the step was recorded in full. Produced by [`StepRef::into_owned`]; the tracer stores steps in a
+/// [`StepStore`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallTraceStep {
+    /// Program counter before step execution
+    pub pc: usize,
+    /// Opcode to be executed
+    pub op: OpCode,
+    /// The detail record, if the step was recorded in full.
+    pub detail: Option<StepDetail>,
+}
+
+/// The steps a call executed.
+///
+/// Every step executed while step recording was enabled contributes its program counter and
+/// opcode to a dense *base track*. The steps that were *recorded in full* — all of them under
+/// [`StepRecording::Full`](crate::tracing::StepRecording), or those inside a window in which full
+/// recording was switched on — additionally have a [`StepDetail`] in a sparse *detail overlay*
+/// ordered by step. [`TraceMemberOrder::Step`] entries in a node's ordering index the overlay: only
+/// detailed steps are interleaved with calls and logs.
+///
+/// # Invariants
+///
+/// Every step has a program counter and an opcode ([`Self::len`] counts them); every detail record
+/// belongs to a distinct step of the base track ([`Self::detailed_len`] is at most `len`), and
+/// [`Self::iter_detailed`] yields them in strictly increasing `step_index` order. Deserialization
+/// rejects input that violates them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct StepStore {
+    /// Program counter of each executed step.
+    pcs: Vec<u32>,
+    /// Opcode of each executed step.
+    ops: Vec<u8>,
+    /// Base-track index of each detail record, strictly increasing.
+    detail_steps: Vec<u32>,
+    /// Detail records of the steps recorded in full, in step order.
+    details: Vec<StepDetail>,
+}
+
+impl StepStore {
+    /// Returns how many steps the base track holds: every step executed while step recording was
+    /// enabled.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.pcs.len()
+    }
+
+    /// Returns true if the base track is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.pcs.is_empty()
+    }
+
+    /// Returns how many steps were recorded in full.
+    #[inline]
+    pub fn detailed_len(&self) -> usize {
+        self.details.len()
+    }
+
+    /// Returns the opcode of the step at `idx` in the base track.
+    ///
+    /// # Panics
+    ///
+    /// If `idx` is out of bounds.
+    #[inline]
+    pub(crate) fn op_at(&self, idx: usize) -> u8 {
+        self.ops[idx]
+    }
+
+    /// Returns a view of the step at `idx` in the base track.
+    ///
+    /// The detail record, if any, is located by a binary search of the overlay; iterate with
+    /// [`Self::iter`] to walk both tracks in one pass.
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<StepRef<'_>> {
+        let pc = *self.pcs.get(idx)?;
+        let op = OpCode::new_or_unknown(self.ops[idx]);
+        let detail = self.detail_steps.binary_search(&(idx as u32)).ok().map(|k| &self.details[k]);
+        Some(StepRef { pc: pc as usize, op, step_index: idx, detail })
+    }
+
+    /// Returns a view of every step in the base track, in execution order.
+    #[inline]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = StepRef<'_>> + DoubleEndedIterator + Clone {
+        StepIter {
+            store: self,
+            front: 0,
+            back: self.pcs.len(),
+            detail_front: 0,
+            detail_back: self.details.len(),
+        }
+    }
+
+    /// Returns a view of the steps that were recorded in full, in execution order.
+    #[inline]
+    pub fn iter_detailed(
+        &self,
+    ) -> impl ExactSizeIterator<Item = DetailedStepRef<'_>> + DoubleEndedIterator + Clone {
+        self.detail_steps
+            .iter()
+            .zip(&self.details)
+            .map(|(&step_index, detail)| self.detailed_ref(step_index as usize, detail))
+    }
+
+    /// Returns the `k`-th detailed step, `k` being the index a [`TraceMemberOrder::Step`] entry
+    /// carries: the position of the step's detail record in the overlay, not its position in the
+    /// base track.
+    #[inline]
+    pub fn detailed(&self, k: usize) -> Option<DetailedStepRef<'_>> {
+        let detail = self.details.get(k)?;
+        Some(self.detailed_ref(self.detail_steps[k] as usize, detail))
+    }
+
+    /// Returns the last step recorded in full, if any.
+    #[inline]
+    pub fn last_detailed(&self) -> Option<DetailedStepRef<'_>> {
+        self.detailed(self.details.len().checked_sub(1)?)
+    }
+
+    /// Returns the `k`-th detail record; see [`Self::detailed`] for the index.
+    #[inline]
+    pub fn detail(&self, k: usize) -> Option<&StepDetail> {
+        self.details.get(k)
+    }
+
+    /// Returns the `k`-th detail record mutably — for decoders that fill in
+    /// [`StepDetail::decoded`]; see [`Self::detailed`] for the index.
+    #[inline]
+    pub fn detail_mut(&mut self, k: usize) -> Option<&mut StepDetail> {
+        self.details.get_mut(k)
+    }
+
+    /// Returns the last detail record together with the base-track index of its step, mutably.
+    #[inline]
+    pub(crate) fn last_detail_mut(&mut self) -> Option<(usize, &mut StepDetail)> {
+        let step_index = *self.detail_steps.last()? as usize;
+        Some((step_index, self.details.last_mut()?))
+    }
+
+    /// Appends a step to the base track and returns its index.
+    ///
+    /// The inspector records steps itself; this is for building traces by hand, e.g. in tests.
+    #[inline]
+    pub fn push(&mut self, pc: usize, op: OpCode) -> usize {
+        // Code size is bounded by the gas cost of supplying it, far below `u32::MAX`, so the cast
+        // cannot truncate.
+        debug_assert!(u32::try_from(pc).is_ok(), "program counter {pc} exceeds u32");
+        self.pcs.push(pc as u32);
+        self.ops.push(op.get());
+        self.pcs.len() - 1
+    }
+
+    /// Appends a detail record for the step at `step_index`, which must be the last step of the
+    /// base track, and returns its index, i.e. the value a [`TraceMemberOrder::Step`] entry for it
+    /// should carry.
+    ///
+    /// # Panics
+    ///
+    /// If `step_index` is not the last step of the base track, or that step already has a detail
+    /// record.
+    #[inline]
+    pub fn push_detail(&mut self, step_index: usize, detail: StepDetail) -> usize {
+        assert_eq!(step_index + 1, self.pcs.len(), "a detail record belongs to the last step");
+        assert_ne!(
+            self.detail_steps.last().copied(),
+            Some(step_index as u32),
+            "a step has at most one detail record"
+        );
+        self.detail_steps.push(step_index as u32);
+        self.details.push(detail);
+        self.details.len() - 1
+    }
+
+    /// Discards the detail records, keeping the base track.
+    pub(crate) fn clear_details(&mut self) {
+        self.detail_steps = Vec::new();
+        self.details = Vec::new();
+    }
+
+    /// Clears the store for reuse, keeping the allocated capacity.
+    pub(crate) fn reset(&mut self) {
+        self.pcs.clear();
+        self.ops.clear();
+        self.detail_steps.clear();
+        self.details.clear();
+    }
+
+    /// Returns an estimate of the heap bytes the store keeps alive: its columns and the snapshots
+    /// and boxed fields the detail records own. Shared [`Bytes`] buffers are counted once per
+    /// record that references them, and the strings inside [`DecodedTraceStep`] are not counted.
+    pub fn bytes(&self) -> usize {
+        self.capacity_bytes() + self.details.iter().map(StepDetail::owned_bytes).sum::<usize>()
+    }
+
+    /// Returns the heap bytes the store's columns occupy, including unused capacity.
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self.pcs.capacity() * core::mem::size_of::<u32>()
+            + self.ops.capacity()
+            + self.detail_steps.capacity() * core::mem::size_of::<u32>()
+            + self.details.capacity() * core::mem::size_of::<StepDetail>()
+    }
+
+    #[inline]
+    fn detailed_ref<'a>(
+        &'a self,
+        step_index: usize,
+        detail: &'a StepDetail,
+    ) -> DetailedStepRef<'a> {
+        DetailedStepRef {
+            pc: self.pcs[step_index] as usize,
+            op: OpCode::new_or_unknown(self.ops[step_index]),
+            step_index,
+            detail,
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for StepStore {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        #[derive(serde::Deserialize)]
+        struct Repr {
+            pcs: Vec<u32>,
+            ops: Vec<u8>,
+            detail_steps: Vec<u32>,
+            details: Vec<StepDetail>,
+        }
+
+        let Repr { pcs, ops, detail_steps, details } = Repr::deserialize(deserializer)?;
+        if pcs.len() != ops.len() {
+            return Err(D::Error::custom("`pcs` and `ops` differ in length"));
+        }
+        if detail_steps.len() != details.len() {
+            return Err(D::Error::custom("`detail_steps` and `details` differ in length"));
+        }
+        let in_range = detail_steps.iter().all(|&step| (step as usize) < pcs.len());
+        let increasing = detail_steps.windows(2).all(|pair| pair[0] < pair[1]);
+        if !in_range || !increasing {
+            return Err(D::Error::custom(
+                "`detail_steps` must be strictly increasing indices into the base track",
+            ));
+        }
+        Ok(Self { pcs, ops, detail_steps, details })
+    }
+}
+
+/// Iterator over every step of a [`StepStore`], walking the base track and the detail overlay in
+/// one pass.
+#[derive(Clone)]
+struct StepIter<'a> {
+    store: &'a StepStore,
+    front: usize,
+    back: usize,
+    /// Detail records not yet yielded from the front.
+    detail_front: usize,
+    /// Detail records not yet yielded from the back.
+    detail_back: usize,
+}
+
+impl<'a> StepIter<'a> {
+    #[inline]
+    fn step(&self, idx: usize, detail: Option<usize>) -> StepRef<'a> {
+        let store = self.store;
+        StepRef {
+            pc: store.pcs[idx] as usize,
+            op: OpCode::new_or_unknown(store.ops[idx]),
+            step_index: idx,
+            detail: detail.map(|k| &store.details[k]),
+        }
+    }
+}
+
+impl<'a> Iterator for StepIter<'a> {
+    type Item = StepRef<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        let idx = self.front;
+        self.front += 1;
+        let detail = (self.detail_front < self.detail_back
+            && self.store.detail_steps[self.detail_front] as usize == idx)
+            .then(|| {
+                self.detail_front += 1;
+                self.detail_front - 1
+            });
+        Some(self.step(idx, detail))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.back - self.front;
+        (len, Some(len))
+    }
+}
+
+impl DoubleEndedIterator for StepIter<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        let idx = self.back;
+        let detail = (self.detail_front < self.detail_back
+            && self.store.detail_steps[self.detail_back - 1] as usize == idx)
+            .then(|| {
+                self.detail_back -= 1;
+                self.detail_back
+            });
+        Some(self.step(idx, detail))
+    }
+}
+
+impl ExactSizeIterator for StepIter<'_> {}
+
+/// A borrowed view of one recorded step: its program counter and opcode, plus the detail record
+/// when the step was recorded in full.
+///
+/// Consumers read steps through [`CallTrace::iter_steps`] and [`CallTrace::iter_detailed_steps`]
+/// rather than through the storage in [`CallTrace::steps`].
+#[derive(Clone, Copy, Debug)]
+pub struct StepRef<'a> {
+    /// Program counter before step execution
+    pub pc: usize,
+    /// Opcode to be executed
+    pub op: OpCode,
+    /// Index of the step in the call's base track.
+    pub step_index: usize,
+    detail: Option<&'a StepDetail>,
+}
+
+impl<'a> StepRef<'a> {
+    /// Returns the step's detail record, if it was recorded in full, borrowed from the trace rather
+    /// than from this view.
+    #[inline]
+    pub const fn detail(self) -> Option<&'a StepDetail> {
+        self.detail
+    }
+
+    /// Returns the step as a detailed step, if it was recorded in full.
+    #[inline]
+    pub const fn detailed(self) -> Option<DetailedStepRef<'a>> {
+        match self.detail {
+            Some(detail) => Some(DetailedStepRef {
+                pc: self.pc,
+                op: self.op,
+                step_index: self.step_index,
+                detail,
+            }),
+            None => None,
+        }
+    }
+
+    /// Returns true if the step is a call-like operation: `CALL`, `CALLCODE`, `DELEGATECALL`,
+    /// `STATICCALL`, `CREATE` or `CREATE2`.
+    #[inline]
+    pub const fn is_call_like_op(self) -> bool {
+        is_call_like_op(self.op)
+    }
+
+    /// Copies the step out of the store, cloning its detail record and the snapshots the record
+    /// owns.
+    pub fn into_owned(self) -> CallTraceStep {
+        CallTraceStep { pc: self.pc, op: self.op, detail: self.detail.cloned() }
+    }
+}
+
+/// A borrowed view of one step that was recorded in full. Dereferences to its [`StepDetail`], so
+/// the record's fields can be read directly; [`Self::pc`], [`Self::op`] and [`Self::step_index`]
+/// are the view's own copies.
+///
+/// Field access through the dereference borrows the view, not the trace. When a borrow must
+/// outlive the view — for instance to collect references from several steps — use the accessors
+/// that return `'a` references, such as [`Self::storage_change`].
+#[derive(Clone, Copy, Debug)]
+pub struct DetailedStepRef<'a> {
+    /// Program counter before step execution
+    pub pc: usize,
+    /// Opcode to be executed
+    pub op: OpCode,
+    /// Index of the step in the call's base track.
+    pub step_index: usize,
+    detail: &'a StepDetail,
+}
+
+impl<'a> DetailedStepRef<'a> {
+    /// Returns the step's detail record, borrowed from the trace rather than from this view.
+    #[inline]
+    pub const fn detail(self) -> &'a StepDetail {
+        self.detail
+    }
+
+    /// Returns the step's storage change, if any, borrowed from the trace rather than from this
+    /// view.
+    #[inline]
+    pub fn storage_change(self) -> Option<&'a StorageChange> {
+        self.detail.storage_change.as_deref()
+    }
+
+    /// Returns the step's decoded data, if any, borrowed from the trace rather than from this
+    /// view.
+    #[inline]
+    pub fn decoded(self) -> Option<&'a DecodedTraceStep> {
+        self.detail.decoded.as_deref()
+    }
+
+    /// Returns true if the step is a STOP opcode
+    #[inline]
+    pub(crate) const fn is_stop(self) -> bool {
+        matches!(self.op.get(), opcode::STOP)
+    }
+
+    /// Returns true if the step is a call-like operation: `CALL`, `CALLCODE`, `DELEGATECALL`,
+    /// `STATICCALL`, `CREATE` or `CREATE2`.
+    #[inline]
+    pub const fn is_call_like_op(self) -> bool {
+        is_call_like_op(self.op)
+    }
+
     /// Converts this step into a geth [StructLog]
     ///
     /// This sets memory and stack capture based on the `opts` parameter.
@@ -778,84 +1277,14 @@ impl CallTraceStep {
             ..Default::default()
         }
     }
-
-    // Returns true if the status code is an error or revert, See [InstructionResult::Revert]
-    #[inline]
-    pub(crate) const fn is_error(&self) -> bool {
-        let Some(status) = self.status else {
-            return false;
-        };
-        status.is_halt()
-    }
-
-    /// Returns the error message if it is an erroneous result.
-    #[inline]
-    pub(crate) fn as_error(&self) -> Option<String> {
-        self.is_error().then(|| format!("{:?}", self.status))
-    }
-
-    /// Returns `DecodedTraceStep` from `CallTraceStep`.
-    pub fn decoded_mut(&mut self) -> &mut DecodedTraceStep {
-        self.decoded.get_or_insert_with(|| Box::new(DecodedTraceStep::Line(String::new())))
-    }
-}
-
-/// A borrowed view of one recorded step. Dereferences to the step's [`CallTraceStep`], so its
-/// fields can be read directly; [`Self::pc`] and [`Self::op`] are the view's own copies.
-///
-/// Field access through the dereference borrows the view, not the trace. When a borrow must
-/// outlive the view — for instance to collect references from several steps — use the accessors
-/// that return `'a` references, such as [`Self::storage_change`].
-#[derive(Clone, Copy, Debug)]
-pub struct DetailedStepRef<'a> {
-    /// Program counter before step execution
-    pub pc: usize,
-    /// Opcode to be executed
-    pub op: OpCode,
-    step: &'a CallTraceStep,
-}
-
-impl<'a> DetailedStepRef<'a> {
-    /// Creates a view of `step`, caching its `pc` and `op`.
-    #[inline]
-    const fn new(step: &'a CallTraceStep) -> Self {
-        Self { pc: step.pc, op: step.op, step }
-    }
-
-    /// Returns the step's storage change, if any, borrowed from the trace rather than from this
-    /// view.
-    #[inline]
-    pub fn storage_change(self) -> Option<&'a StorageChange> {
-        self.step.storage_change.as_deref()
-    }
-
-    /// Returns the step's decoded data, if any, borrowed from the trace rather than from this
-    /// view.
-    #[inline]
-    pub fn decoded(self) -> Option<&'a DecodedTraceStep> {
-        self.step.decoded.as_deref()
-    }
-
-    /// Returns true if the step is a STOP opcode
-    #[inline]
-    pub(crate) const fn is_stop(self) -> bool {
-        matches!(self.op.get(), opcode::STOP)
-    }
-
-    /// Returns true if the step is a call-like operation: `CALL`, `CALLCODE`, `DELEGATECALL`,
-    /// `STATICCALL`, `CREATE` or `CREATE2`.
-    #[inline]
-    pub const fn is_call_like_op(self) -> bool {
-        is_call_like_op(self.op)
-    }
 }
 
 impl core::ops::Deref for DetailedStepRef<'_> {
-    type Target = CallTraceStep;
+    type Target = StepDetail;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        self.step
+        self.detail
     }
 }
 
@@ -959,26 +1388,5 @@ impl RecordedMemory {
 impl AsRef<[u8]> for RecordedMemory {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
-    }
-}
-
-#[cfg(feature = "serde")]
-mod opcode_serde {
-    use super::OpCode;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub(super) fn serialize<S>(op: &OpCode, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_u8(op.get())
-    }
-
-    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<OpCode, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let op = u8::deserialize(deserializer)?;
-        Ok(OpCode::new(op).unwrap_or_else(|| OpCode::new(revm::bytecode::opcode::INVALID).unwrap()))
     }
 }
