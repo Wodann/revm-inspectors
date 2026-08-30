@@ -101,12 +101,44 @@ pub struct CallTrace {
     /// The final status of the call.
     pub status: Option<InstructionResult>,
     /// Opcode-level execution steps.
+    ///
+    /// Prefer reading these through [`Self::iter_detailed_steps`] and [`Self::detailed_step`]:
+    /// direct access couples the reader to how steps are stored.
     pub steps: Vec<CallTraceStep>,
     /// Optional complementary decoded call data.
     pub decoded: Option<Box<DecodedCallTrace>>,
 }
 
 impl CallTrace {
+    /// Returns how many steps were recorded.
+    #[inline]
+    pub fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Returns a view of every recorded step, in execution order.
+    #[inline]
+    pub fn iter_detailed_steps(
+        &self,
+    ) -> impl ExactSizeIterator<Item = DetailedStepRef<'_>> + DoubleEndedIterator + Clone {
+        self.steps.iter().map(DetailedStepRef::new)
+    }
+
+    /// Returns the recorded step at `idx`.
+    ///
+    /// Indices come from the enclosing [`CallTraceNode::ordering`] (a [`TraceMemberOrder::Step`]
+    /// entry) and from [`DecodedTraceStep::InternalCall`].
+    #[inline]
+    pub fn detailed_step(&self, idx: usize) -> Option<DetailedStepRef<'_>> {
+        self.steps.get(idx).map(DetailedStepRef::new)
+    }
+
+    /// Returns the last recorded step, if any.
+    #[inline]
+    pub fn last_detailed_step(&self) -> Option<DetailedStepRef<'_>> {
+        self.steps.last().map(DetailedStepRef::new)
+    }
+
     /// Returns true if the status code is an error or revert, See [InstructionResult::Revert]
     #[inline]
     pub const fn is_error(&self) -> bool {
@@ -272,7 +304,7 @@ impl CallTraceNode {
         let initial_len = stack.len();
 
         // First, extend the stack with all steps in reverse order
-        stack.extend(self.trace.steps.iter().rev().map(|step| CallTraceStepStackItem {
+        stack.extend(self.trace.iter_detailed_steps().rev().map(|step| CallTraceStepStackItem {
             trace_node: self,
             step,
             call_child_id: None,
@@ -615,7 +647,7 @@ pub(crate) struct CallTraceStepStackItem<'a> {
     /// The trace node that contains this step
     pub(crate) trace_node: &'a CallTraceNode,
     /// The step that this stack item represents
-    pub(crate) step: &'a CallTraceStep,
+    pub(crate) step: DetailedStepRef<'a>,
     /// The index of the child call in the CallArena if this step's opcode is a call
     pub(crate) call_child_id: Option<usize>,
 }
@@ -747,27 +779,6 @@ impl CallTraceStep {
         }
     }
 
-    /// Returns true if the step is a STOP opcode
-    #[inline]
-    pub(crate) const fn is_stop(&self) -> bool {
-        matches!(self.op.get(), opcode::STOP)
-    }
-
-    /// Returns true if the step is a call operation, any of
-    /// CALL, CALLCODE, DELEGATECALL, STATICCALL, CREATE, CREATE2
-    #[inline]
-    pub(crate) const fn is_call_like_op(&self) -> bool {
-        matches!(
-            self.op.get(),
-            opcode::CALL
-                | opcode::DELEGATECALL
-                | opcode::STATICCALL
-                | opcode::CREATE
-                | opcode::CALLCODE
-                | opcode::CREATE2
-        )
-    }
-
     // Returns true if the status code is an error or revert, See [InstructionResult::Revert]
     #[inline]
     pub(crate) const fn is_error(&self) -> bool {
@@ -787,6 +798,80 @@ impl CallTraceStep {
     pub fn decoded_mut(&mut self) -> &mut DecodedTraceStep {
         self.decoded.get_or_insert_with(|| Box::new(DecodedTraceStep::Line(String::new())))
     }
+}
+
+/// A borrowed view of one recorded step. Dereferences to the step's [`CallTraceStep`], so its
+/// fields can be read directly; [`Self::pc`] and [`Self::op`] are the view's own copies.
+///
+/// Field access through the dereference borrows the view, not the trace. When a borrow must
+/// outlive the view — for instance to collect references from several steps — use the accessors
+/// that return `'a` references, such as [`Self::storage_change`].
+#[derive(Clone, Copy, Debug)]
+pub struct DetailedStepRef<'a> {
+    /// Program counter before step execution
+    pub pc: usize,
+    /// Opcode to be executed
+    pub op: OpCode,
+    step: &'a CallTraceStep,
+}
+
+impl<'a> DetailedStepRef<'a> {
+    /// Creates a view of `step`, caching its `pc` and `op`.
+    #[inline]
+    const fn new(step: &'a CallTraceStep) -> Self {
+        Self { pc: step.pc, op: step.op, step }
+    }
+
+    /// Returns the step's storage change, if any, borrowed from the trace rather than from this
+    /// view.
+    #[inline]
+    pub fn storage_change(self) -> Option<&'a StorageChange> {
+        self.step.storage_change.as_deref()
+    }
+
+    /// Returns the step's decoded data, if any, borrowed from the trace rather than from this
+    /// view.
+    #[inline]
+    pub fn decoded(self) -> Option<&'a DecodedTraceStep> {
+        self.step.decoded.as_deref()
+    }
+
+    /// Returns true if the step is a STOP opcode
+    #[inline]
+    pub(crate) const fn is_stop(self) -> bool {
+        matches!(self.op.get(), opcode::STOP)
+    }
+
+    /// Returns true if the step is a call-like operation: `CALL`, `CALLCODE`, `DELEGATECALL`,
+    /// `STATICCALL`, `CREATE` or `CREATE2`.
+    #[inline]
+    pub const fn is_call_like_op(self) -> bool {
+        is_call_like_op(self.op)
+    }
+}
+
+impl core::ops::Deref for DetailedStepRef<'_> {
+    type Target = CallTraceStep;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.step
+    }
+}
+
+/// Returns true if `op` is a call-like operation: `CALL`, `CALLCODE`, `DELEGATECALL`,
+/// `STATICCALL`, `CREATE` or `CREATE2`.
+#[inline]
+pub(crate) const fn is_call_like_op(op: OpCode) -> bool {
+    matches!(
+        op.get(),
+        opcode::CALL
+            | opcode::DELEGATECALL
+            | opcode::STATICCALL
+            | opcode::CREATE
+            | opcode::CALLCODE
+            | opcode::CREATE2
+    )
 }
 
 /// Represents the source of a storage change - e.g., whether it came

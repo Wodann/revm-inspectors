@@ -367,16 +367,17 @@ impl<W: Write> TraceWriter<W> {
         step_idx: usize,
     ) -> io::Result<usize> {
         let node = &nodes[node_idx];
-        let step = &node.trace.steps[step_idx];
-
-        let Some(decoded) = &step.decoded else {
-            // We only write explicitly decoded steps to avoid bloating the output.
+        // We only write explicitly decoded steps to avoid bloating the output.
+        let Some(decoded) = node.trace.detailed_step(step_idx).and_then(|step| step.decoded())
+        else {
             return Ok(item_idx + 1);
         };
+        let gas_used_at =
+            |idx: usize| node.trace.detailed_step(idx).map_or(0, |step| step.gas_used);
 
-        match &**decoded {
+        match decoded {
             DecodedTraceStep::InternalCall(call, end_idx) => {
-                let gas_used = node.trace.steps[*end_idx].gas_used.saturating_sub(step.gas_used);
+                let gas_used = gas_used_at(*end_idx).saturating_sub(gas_used_at(step_idx));
 
                 self.write_branch()?;
                 self.indentation_level += 1;
@@ -504,8 +505,8 @@ impl<W: Write> TraceWriter<W> {
         // writes. Store the change id so we can write the storage changes in chronological order
         // of their last write.
         let mut change_id = 0;
-        for step in &node.trace.steps {
-            if let Some(change) = &step.storage_change {
+        for step in node.trace.iter_detailed_steps() {
+            if let Some(change) = step.storage_change() {
                 // Only handle storage changes, signalled by `had_value` being `Some`.
                 if change.had_value.is_some() {
                     let (_first, last, last_change_id) =
