@@ -60,6 +60,11 @@ name = "js_tracer"
 path = "benches/js_tracer.rs"
 harness = false
 
+[[bench]]
+name = "step_recording"
+path = "benches/step_recording.rs"
+harness = false
+
 [features]
 default = ["std"]
 std = [
