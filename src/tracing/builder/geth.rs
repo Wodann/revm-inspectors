@@ -53,7 +53,7 @@ impl<'a> GethTraceBuilder<'a> {
 
     /// Returns the sum of all steps in the recorded node traces.
     fn trace_step_count(&self) -> usize {
-        self.nodes.iter().map(|node| node.trace.steps.len()).sum()
+        self.nodes.iter().map(|node| node.trace.step_count()).sum()
     }
 
     /// Fill in the geth trace with all steps of the trace and its children traces in the order they
@@ -71,7 +71,7 @@ impl<'a> GethTraceBuilder<'a> {
         // they appear in the transaction, we need to process steps of call nodes when they appear.
         // When we find a call step, we push all the steps of the child trace on the stack, so they
         // are processed next. The very next step is the last item on the stack
-        let mut step_stack = VecDeque::with_capacity(main_trace_node.trace.steps.len());
+        let mut step_stack = VecDeque::with_capacity(main_trace_node.trace.step_count());
 
         main_trace_node.push_steps_on_stack(&mut step_stack);
 
@@ -413,7 +413,7 @@ impl<'a> GethTraceBuilder<'a> {
             let mut keccak = Vec::new();
             let mut out_of_gas = false;
 
-            for step in &trace.steps {
+            for step in trace.iter_detailed_steps() {
                 let op = step.op.get();
 
                 // Skip if opcode is ignored

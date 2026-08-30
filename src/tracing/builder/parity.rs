@@ -1,6 +1,6 @@
 use super::walker::CallTraceNodeWalkerBF;
 use crate::tracing::{
-    types::{CallTraceNode, CallTraceStep},
+    types::{CallTraceNode, DetailedStepRef},
     utils::load_account_code,
     TracingInspectorConfig,
 };
@@ -294,8 +294,8 @@ impl ParityTraceBuilder {
 
     /// Returns the last recorded step
     #[inline]
-    fn last_step(&self) -> Option<&CallTraceStep> {
-        self.nodes.last().and_then(|node| node.trace.steps.last())
+    fn last_step(&self) -> Option<DetailedStepRef<'_>> {
+        self.nodes.last().and_then(|node| node.trace.last_detailed_step())
     }
 
     /// Returns true if the last recorded step is a STOP
@@ -331,9 +331,9 @@ impl ParityTraceBuilder {
                     current = self.nodes.get(*child).expect("there should be a child");
                 }
                 None => {
-                    let mut instructions = Vec::with_capacity(current.trace.steps.len());
+                    let mut instructions = Vec::with_capacity(current.trace.step_count());
 
-                    for step in &current.trace.steps {
+                    for step in current.trace.iter_detailed_steps() {
                         let maybe_sub_call = if step.is_call_like_op() {
                             sub_stack.pop_front().flatten()
                         } else {
@@ -370,11 +370,11 @@ impl ParityTraceBuilder {
         VmTrace { code: Default::default(), ops: instructions }
     }
 
-    /// Creates a VM instruction from a [CallTraceStep] and a [VmTrace] for the subcall if there is
-    /// one
+    /// Creates a VM instruction from a [DetailedStepRef] and a [VmTrace] for the subcall if there
+    /// is one
     fn make_instruction(
         &self,
-        step: &CallTraceStep,
+        step: DetailedStepRef<'_>,
         maybe_sub_call: Option<VmTrace>,
     ) -> VmInstruction {
         let maybe_storage = step.storage_change.as_ref().map(|storage_change| StorageDelta {
