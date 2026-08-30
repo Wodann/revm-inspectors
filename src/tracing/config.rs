@@ -51,14 +51,53 @@ impl OpcodeFilter {
     }
 }
 
+/// How much of each executed EVM step to record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StepRecording {
+    /// Do not record steps.
+    #[default]
+    None,
+    /// Record a full [`CallTraceStep`](crate::tracing::types::CallTraceStep) — gas accounting,
+    /// status and the snapshots the other `record_*` options enable — for every executed step the
+    /// [`OpcodeFilter`] admits. These are the steps
+    /// [`CallTrace::iter_detailed_steps`](crate::tracing::types::CallTrace::iter_detailed_steps)
+    /// yields.
+    Full,
+}
+
+impl StepRecording {
+    /// Returns true if any per-step recording is enabled. Callers that need the full
+    /// [`CallTraceStep`](crate::tracing::types::CallTraceStep) record should use
+    /// [`Self::is_full`].
+    #[inline]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Returns true if steps are recorded in full.
+    #[inline]
+    pub const fn is_full(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// Returns the more detailed of two settings.
+    #[inline]
+    pub const fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::None, Self::None) => Self::None,
+        }
+    }
+}
+
 /// Gives guidance to the [TracingInspector](crate::tracing::TracingInspector).
 ///
 /// Use [TracingInspectorConfig::default_parity] or [TracingInspectorConfig::default_geth] to get
 /// the default configs for specific styles of traces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct TracingInspectorConfig {
-    /// Whether to record every individual opcode level step.
-    pub record_steps: bool,
+    /// How much of each individual opcode level step to record.
+    pub record_steps: StepRecording,
     /// Whether to record individual memory snapshots.
     pub record_memory_snapshots: bool,
     /// Whether to record individual stack snapshots.
@@ -82,7 +121,7 @@ impl TracingInspectorConfig {
     /// Returns a config with everything enabled.
     pub const fn all() -> Self {
         Self {
-            record_steps: true,
+            record_steps: StepRecording::Full,
             record_memory_snapshots: true,
             record_stack_snapshots: StackSnapshotType::All,
             record_state_diff: true,
@@ -97,7 +136,7 @@ impl TracingInspectorConfig {
     /// Returns a config with everything disabled.
     pub const fn none() -> Self {
         Self {
-            record_steps: false,
+            record_steps: StepRecording::None,
             record_memory_snapshots: false,
             record_stack_snapshots: StackSnapshotType::None,
             record_state_diff: false,
@@ -114,7 +153,7 @@ impl TracingInspectorConfig {
     /// This config does _not_ record opcode level traces and is suited for `trace_transaction`
     pub const fn default_parity() -> Self {
         Self {
-            record_steps: false,
+            record_steps: StepRecording::None,
             record_memory_snapshots: false,
             record_stack_snapshots: StackSnapshotType::None,
             record_state_diff: false,
@@ -154,7 +193,7 @@ impl TracingInspectorConfig {
     /// [StructLogTracer](alloy_rpc_types_trace::geth::DefaultFrame).
     pub const fn default_geth() -> Self {
         Self {
-            record_steps: true,
+            record_steps: StepRecording::Full,
             record_memory_snapshots: false,
             record_stack_snapshots: StackSnapshotType::Full,
             record_state_diff: true,
@@ -251,9 +290,11 @@ impl TracingInspectorConfig {
     }
 
     /// Merge another config into this one.
+    ///
+    /// [`Self::record_steps`] keeps the more detailed of the two settings.
     #[inline]
     pub fn merge(&mut self, other: Self) -> &mut Self {
-        self.record_steps |= other.record_steps;
+        self.record_steps = self.record_steps.merge(other.record_steps);
         self.record_memory_snapshots |= other.record_memory_snapshots;
         self.record_stack_snapshots = other.record_stack_snapshots;
         self.record_state_diff |= other.record_state_diff;
@@ -273,18 +314,27 @@ impl TracingInspectorConfig {
         self
     }
 
-    /// Disable recording of individual opcode level steps
+    /// Disable recording of individual opcode level steps ([`StepRecording::None`])
     pub const fn disable_steps(self) -> Self {
         self.set_steps(false)
     }
 
-    /// Enable recording of individual opcode level steps
+    /// Enable recording of individual opcode level steps in full
     pub const fn steps(self) -> Self {
         self.set_steps(true)
     }
 
-    /// Configure whether individual opcode level steps should be recorded
-    pub const fn set_steps(mut self, record_steps: bool) -> Self {
+    /// Configure whether individual opcode level steps should be recorded in full.
+    pub const fn set_steps(self, record_steps: bool) -> Self {
+        self.set_step_recording(if record_steps {
+            StepRecording::Full
+        } else {
+            StepRecording::None
+        })
+    }
+
+    /// Configure how much of each individual opcode level step to record.
+    pub const fn set_step_recording(mut self, record_steps: StepRecording) -> Self {
         self.record_steps = record_steps;
         self
     }
@@ -339,14 +389,13 @@ impl TracingInspectorConfig {
         self.set_steps_and_state_diffs(true)
     }
 
-    /// Configure whether the tracer should record steps and state diffs.
+    /// Configure whether the tracer should record steps in full and state diffs.
     ///
     /// This is a convenience method for setting both [TracingInspectorConfig::set_steps] and
-    /// [TracingInspectorConfig::set_state_diffs] since tracking state diffs requires steps tracing.
-    pub const fn set_steps_and_state_diffs(mut self, steps_and_diffs: bool) -> Self {
-        self.record_steps = steps_and_diffs;
-        self.record_state_diff = steps_and_diffs;
-        self
+    /// [TracingInspectorConfig::set_state_diffs] since tracking state diffs requires steps recorded
+    /// in full.
+    pub const fn set_steps_and_state_diffs(self, steps_and_diffs: bool) -> Self {
+        self.set_state_diffs(steps_and_diffs).set_steps(steps_and_diffs)
     }
 
     /// Disable recording of individual logs
@@ -447,22 +496,48 @@ mod tests {
         s.insert(TraceType::StateDiff);
         let config = TracingInspectorConfig::from_parity_config(&s);
         // not required
-        assert!(!config.record_steps);
+        assert_eq!(config.record_steps, StepRecording::None);
         assert!(!config.record_state_diff);
 
         let mut s = HashSet::default();
         s.insert(TraceType::VmTrace);
         let config = TracingInspectorConfig::from_parity_config(&s);
-        assert!(config.record_steps);
+        assert_eq!(config.record_steps, StepRecording::Full);
         assert!(!config.record_state_diff);
 
         let mut s = HashSet::default();
         s.insert(TraceType::VmTrace);
         s.insert(TraceType::StateDiff);
         let config = TracingInspectorConfig::from_parity_config(&s);
-        assert!(config.record_steps);
+        assert_eq!(config.record_steps, StepRecording::Full);
         // not required for StateDiff
         assert!(!config.record_state_diff);
+    }
+
+    #[test]
+    fn merge_keeps_the_more_detailed_step_recording() {
+        let mut none = TracingInspectorConfig::none();
+        none.merge(TracingInspectorConfig::default_geth());
+        assert_eq!(none.record_steps, StepRecording::Full);
+
+        let mut full = TracingInspectorConfig::default_geth();
+        full.merge(TracingInspectorConfig::none());
+        assert_eq!(full.record_steps, StepRecording::Full);
+
+        assert_eq!(StepRecording::None.merge(StepRecording::None), StepRecording::None);
+    }
+
+    #[test]
+    fn step_recording_setters() {
+        let config = TracingInspectorConfig::none();
+        assert!(!config.record_steps.is_enabled());
+        assert_eq!(config.set_steps(true).record_steps, StepRecording::Full);
+        assert_eq!(config.set_steps(false).record_steps, StepRecording::None);
+        assert_eq!(config.steps().record_steps, StepRecording::Full);
+        assert_eq!(config.steps().disable_steps().record_steps, StepRecording::None);
+        assert!(config.set_step_recording(StepRecording::Full).record_steps.is_full());
+        let both = config.set_steps_and_state_diffs(true);
+        assert!(both.record_steps.is_full() && both.record_state_diff);
     }
 
     #[test]

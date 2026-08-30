@@ -35,7 +35,7 @@ pub use builder::{
 };
 
 mod config;
-pub use config::{OpcodeFilter, StackSnapshotType, TracingInspectorConfig};
+pub use config::{OpcodeFilter, StackSnapshotType, StepRecording, TracingInspectorConfig};
 
 mod fourbyte;
 pub use fourbyte::FourByteInspector;
@@ -119,7 +119,7 @@ impl TracingInspector {
         } = self;
 
         // if we record steps we can reuse the individual calltracestep vecs
-        if config.record_steps {
+        if config.record_steps.is_full() {
             for node in &mut traces.arena {
                 // move out and store the reusable steps vec
                 let mut steps = mem::take(&mut node.trace.steps);
@@ -603,14 +603,14 @@ where
 {
     #[inline]
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        if self.config.record_steps {
+        if self.config.record_steps.is_full() {
             self.start_step(interp, context);
         }
     }
 
     #[inline]
     fn step_end(&mut self, interp: &mut Interpreter, context: &mut CTX) {
-        if self.config.record_steps {
+        if self.config.record_steps.is_full() {
             self.fill_step_on_step_end(interp, context);
         }
     }
